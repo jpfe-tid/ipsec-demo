@@ -17,7 +17,7 @@ docker-machine create \
   --amazonec2-region ${AWS_REGION} \
   --amazonec2-root-size 30 \
   --amazonec2-ami ${AMI_ID} \
-  node-a
+  node-main
 
 docker-machine create \
   --driver amazonec2 \
@@ -25,7 +25,15 @@ docker-machine create \
   --amazonec2-region ${AWS_REGION} \
   --amazonec2-root-size 30 \
   --amazonec2-ami ${AMI_ID} \
-  node-b
+  node-peer-a
+
+docker-machine create \
+  --driver amazonec2 \
+  --amazonec2-instance-type t3.small \
+  --amazonec2-region ${AWS_REGION} \
+  --amazonec2-root-size 30 \
+  --amazonec2-ami ${AMI_ID} \
+  node-peer-b
 
 SG_ID=$(aws ec2 describe-security-groups \
   --group-names docker-machine \
@@ -59,11 +67,12 @@ aws ec2 authorize-security-group-ingress \
   --region ${AWS_REGION}
 ```
 
-## 2. ssh and install packages (on each node)
+## 2. ssh, install packages and setup environment (on all nodes)
 
 ```sh
-docker-machine ssh node-a
-docker-machine ssh node-b
+docker-machine ssh node-main
+docker-machine ssh node-peer-a
+docker-machine ssh node-peer-b
 ```
 
 ```sh
@@ -74,9 +83,13 @@ sudo apt install \
   strongswan \
   strongswan-pki \
   ipsec-tools
+
+git clone https://github.com/jpfe-tid/ipsec-demo.git
+
+cd ipsec-demo
 ```
 
-## 3. generate ca (optional, provided for convenience)
+## 3. generate ca (on main node)
 
 ```sh
 ipsec pki \
@@ -96,10 +109,10 @@ ipsec pki \
   --outform pem \
     > ca-cert.pem
 
-# copy ca-cert.pem to all nodes
+# copy ca-cert.pem to all peer nodes
 ```
 
-## 4. generate certs (on each node)
+## 4. generate private key and csr (on all peer nodes)
 
 ```sh
 export DEFAULT_INTERFACE='ens5' # node network interface 
@@ -118,25 +131,52 @@ IP=$(ifconfig ${DEFAULT_INTERFACE} | \
   grep 'inet ' | \
   cut -d' ' -f 10)
 
-mkdir -p pki/certs
 ipsec pki \
-  --pub \
+  --req \
   --in ${HOSTNAME}-key.pem \
-  --type rsa | \
-  ipsec pki \
-    --issue \
-    --lifetime 1825 \
-    --cacert ca-cert.pem \
-    --cakey ca-key.pem \
-    --dn "CN=${IP}" \
-    --san "${IP}" \
-    --flag serverAuth \
-    --flag ikeIntermediate \
-    --outform pem \
-      > ${HOSTNAME}-cert.pem
+  --dn "CN=${IP}" \
+  --san "${IP}" \
+  --outform pem \
+    > ${HOSTNAME}-csr.pem
+
+more ${HOSTNAME}-csr.pem | cat
+
+# copy csr to main node for signing
 ```
 
-## 5. copy certs and keys (on each node)
+## 5. sign csr (on main node)
+
+```sh
+ipsec pki \
+  --issue \
+  --in node-peer-a-csr.pem \
+  --type pkcs10 \
+  --lifetime 1825 \
+  --cacert ca-cert.pem \
+  --cakey ca-key.pem \
+  --flag serverAuth \
+  --flag ikeIntermediate \
+  --outform pem \
+    > node-peer-a-cert.pem
+
+ipsec pki \
+  --issue \
+  --in node-peer-b-csr.pem \
+  --type pkcs10 \
+  --lifetime 1825 \
+  --cacert ca-cert.pem \
+  --cakey ca-key.pem \
+  --flag serverAuth \
+  --flag ikeIntermediate \
+  --outform pem \
+    > node-peer-b-cert.pem
+
+more node-peer-*-cert.pem | cat
+
+# copy certificate to their corresponding peer node
+```
+
+## 6. copy certs and keys (on all peer nodes)
 
 ```sh
 cp ca-cert.pem /etc/ipsec.d/cacerts/ca-cert.pem
@@ -151,13 +191,13 @@ ls -lah \
   /etc/ipsec.d/private
 ```
 
-## 6. copy conf (on each node)
+## 7. copy conf (on all peer nodes)
 
 ```sh
-export LEFT_IP='172.31.1.101' # node-a IP
-export LEFT_HOSTNAME='node-a'
-export RIGHT_IP='172.31.1.102' # node-b IP
-export RIGHT_HOSTNAME='node-b'
+export LEFT_IP='172.31.1.101' # node-peer-a IP
+export LEFT_HOSTNAME='node-peer-a'
+export RIGHT_IP='172.31.1.102' # node-peer-b IP
+export RIGHT_HOSTNAME='node-peer-b'
 export HOSTNAME
 ```
 
@@ -171,17 +211,31 @@ ls -lah \
   /etc/ipsec.conf
 ```
 
-## 7. restart ipsec daemon, start tunnel and test ping (on each node)
+## 8. setup internal ip addresses (on each peer node)
 
 ```sh
-ip a a 10.0.1.1 dev lo # on node-a (internal ip)
-ip a a 10.0.2.1 dev lo # on node-b (internal ip)
+ip a a 10.0.1.1 dev lo # on node-peer-a (internal ip)
+ip a a 10.0.2.1 dev lo # on node-peer-b (internal ip)
+```
 
+## 9. restart ipsec daemon, start tunnel and test ping (on all peer nodes)
+
+```sh
 ipsec restart
 
 ipsec up tunnel
 
 ipsec status
+```
 
-ping 10.0.2.1 # on node-a (10.0.1.1)
+## 10. test
+
+```sh
+ping 10.0.2.1 # on node-peer-a (10.0.1.1)
+ping 10.0.1.1 # on node-peer-b (10.0.2.1)
+```
+
+## 11. clean
+```sh
+docker-machine rm node-main node-peer-a node-peer-b
 ```
